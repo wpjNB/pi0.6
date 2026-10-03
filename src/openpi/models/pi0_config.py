@@ -29,8 +29,17 @@ class MEMConfig:
     # Total number of frames K fed to the video encoder (including current frame).
     # Pre-training typically uses 6; fine-tuning can extend up to 18.
     video_memory_frames: int = 6
-    # Wall-clock stride between history frames (seconds), used by the data loader.
+    # Wall-clock stride between consecutive history frames (seconds).
+    # Matches the MEM paper, whose architecture diagram labels the inputs
+    # "2 SECS AGO / 1 SEC AGO / CURRENT".  The data loader converts this to a
+    # frame count via round(video_frame_stride_sec * dataset_fps), so the
+    # memory horizon stays constant across datasets with different frame rates.
     video_frame_stride_sec: float = 1.0
+    # How history timestamps are resolved by the data loader:
+    #   "timestamp" – use each frame's recorded timestamp (robust to dropped
+    #                 frames and non-uniform capture).
+    #   "frame"     – assume a uniform grid at the dataset fps.
+    video_time_source: str = "timestamp"
     # Insert SpaceTimeSeparableBlock every N ViT layers.
     temporal_attn_every_n_layers: int = 4
     # Drop history tokens after this ViT layer (negative = from end).

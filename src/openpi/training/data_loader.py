@@ -16,6 +16,8 @@ import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
+logger = logging.getLogger(__name__)
+
 T_co = TypeVar("T_co", covariant=True)
 
 
@@ -176,6 +178,17 @@ def create_torch_dataset(
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+
+    # π0.6-MEM: wrap the dataset so each sample carries K-frame visual history
+    # sampled on a wall-clock grid (paper setting: 1 s between memory frames).
+    if model_config.use_video_memory:
+        dataset = MEMLeRobotDataset(
+            dataset,
+            num_frames=model_config.video_memory_frames,
+            frame_stride_sec=model_config.mem.video_frame_stride_sec,
+            fps=dataset_meta.fps,
+            time_source=model_config.mem.video_time_source,
+        )
 
     if data_config.recap_fields_path is not None:
         dataset = ReCAPFieldsDataset(dataset, data_config.recap_fields_path)
@@ -579,37 +592,77 @@ class DataLoaderImpl(DataLoader):
 class MEMLeRobotDataset(Dataset):
     """Wraps a LeRobot dataset to provide K-frame visual history.
 
+    History is sampled on a **wall-clock** grid, matching the MEM paper where
+    consecutive memory frames are ``frame_stride_sec`` apart (the paper uses
+    1 second; the architecture diagram labels the inputs ``2 SECS AGO / 1 SEC
+    AGO / CURRENT``).  This keeps the memory horizon identical across datasets
+    with different frame rates, which a raw frame-count stride cannot do.
+
     For each sample the wrapper:
-    1. Samples K-1 history-frame indices (with episode-boundary padding).
+    1. Samples K-1 history-frame indices on a fixed time grid.
     2. Stacks the history frames per camera into ``image_history``.
     3. Stacks past proprioceptive states into ``state_history``.
-    4. Optionally attaches a pre-computed language-memory label.
+    4. Attaches ``image_history_masks`` marking padded (unavailable) frames.
+    5. Optionally attaches a pre-computed language-memory label.
 
     Args:
-        dataset:             Underlying LeRobot dataset.
-        num_frames:          K – total frames (1 current + K-1 history).
-        stride:              Dataset-frame stride between history samples.
-        memory_labels_path:  JSON-Lines file produced by
-                             ``gen_memory_labels.py``.  Optional.
-        camera_keys:         Camera names to build history for.
+        dataset:            Underlying LeRobot dataset.
+        num_frames:         K – total frames (1 current + K-1 history).
+        frame_stride_sec:   Wall-clock interval between consecutive memory
+                            frames, in seconds. Default 1.0 (paper setting).
+        fps:                Dataset frame rate. When None it is inferred from
+                            the dataset metadata (``meta/info.json``).
+        time_source:        ``"timestamp"`` samples by actual per-frame
+                            timestamps (robust to dropped frames); ``"frame"``
+                            assumes a uniform ``fps`` grid.
+        memory_labels_path: JSON-Lines file produced by
+                            ``gen_memory_labels.py``. Optional.
+        camera_keys:        Camera names to build history for. When None the
+                            video features are discovered from the dataset
+                            metadata and mapped to the policy's short names.
     """
+
+    # Fallback camera names used when a dataset's video features cannot be
+    # discovered (kept for backwards compatibility with existing callers).
+    DEFAULT_CAMERA_KEYS = (
+        "base_0_rgb",
+        "left_wrist_0_rgb",
+        "right_wrist_0_rgb",
+    )
 
     def __init__(
         self,
         dataset: Dataset,
         num_frames: int = 6,
-        stride: int = 5,
+        frame_stride_sec: float = 1.0,
+        fps: float | None = None,
+        time_source: str = "timestamp",
         memory_labels_path: str | None = None,
         camera_keys: list[str] | None = None,
     ) -> None:
+        if num_frames < 1:
+            raise ValueError(f"num_frames must be >= 1, got {num_frames}.")
+        if frame_stride_sec <= 0:
+            raise ValueError(f"frame_stride_sec must be > 0, got {frame_stride_sec}.")
+        if time_source not in ("timestamp", "frame"):
+            raise ValueError(f"time_source must be 'timestamp' or 'frame', got {time_source!r}.")
+
         self._ds = dataset
         self.K = num_frames
-        self.stride = stride
-        self.camera_keys = camera_keys or [
-            "base_0_rgb",
-            "left_wrist_0_rgb",
-            "right_wrist_0_rgb",
-        ]
+        self.frame_stride_sec = float(frame_stride_sec)
+        self.time_source = time_source
+
+        # Resolve the dataset frame rate once at construction time.
+        self.fps = float(fps) if fps is not None else self._infer_fps()
+        if self.fps <= 0:
+            raise ValueError(f"Could not determine a valid dataset fps (got {self.fps}).")
+
+        # Frame-count stride derived from the wall-clock stride. Every sample
+        # then covers the same wall-clock window regardless of the dataset fps
+        # (e.g. 1 s x 20 fps = 20 frames on G1, 1 s x 50 fps = 50 on ALOHA).
+        self.stride = max(1, round(self.frame_stride_sec * self.fps))
+
+        self.camera_keys = camera_keys or self._discover_camera_keys()
 
         # Load language-memory labels (optional)
         self._memory_labels: dict[tuple[str, int], str] = {}
@@ -638,7 +691,7 @@ class MEMLeRobotDataset(Dataset):
         frame_idx = int(sample.get("frame_index", 0))
 
         if self.K > 1:
-            history_indices = self._history_indices(episode_id, frame_idx)
+            history_indices, valid_mask = self._history_indices(episode_id, frame_idx)
             image_history: dict[str, np.ndarray] = {}
             state_history_list: list[np.ndarray] = []
 
@@ -658,6 +711,13 @@ class MEMLeRobotDataset(Dataset):
                 sample["image_history"] = {
                     k: np.stack(v, axis=0) for k, v in image_history.items()
                 }
+                # Mark which history slots hold a real observed frame. Frames
+                # before the episode start are padded with the first frame, so
+                # without this mask the video encoder cannot tell genuine
+                # history from duplicated padding.
+                sample["image_history_masks"] = {
+                    k: valid_mask.copy() for k in image_history
+                }
             if state_history_list:
                 sample["state_history"] = np.stack(state_history_list, axis=0)
 
@@ -669,20 +729,157 @@ class MEMLeRobotDataset(Dataset):
         return sample
 
     # ------------------------------------------------------------------
-    def _history_indices(self, episode_id: int, current_frame: int) -> list[int]:
-        """Return K-1 absolute dataset indices for the history frames."""
+    def _history_indices(self, episode_id: int, current_frame: int) -> tuple[list[int], np.ndarray]:
+        """Return K-1 absolute dataset indices for the history frames.
+
+        The history is laid out on a fixed wall-clock grid: the i-th history
+        slot (i = K-1 … 1) targets the frame that was ``i * frame_stride_sec``
+        seconds in the past.  When that time precedes the episode start the
+        slot is clamped to the episode's first frame and flagged as invalid in
+        the returned mask.
+
+        ``current_frame`` is the per-episode ``frame_index`` reported by
+        LeRobot; all timestamp lookups are done on absolute dataset indices so
+        that episodes after the first are handled correctly.
+
+        Returns:
+            (indices, valid_mask) where ``indices`` has K-1 entries in
+            oldest-to-newest order and ``valid_mask`` is a bool array of the
+            same length (True = real observed frame, False = padded).
+        """
         ep_start = self._episode_start(episode_id)
+        ep_end = self._episode_end(episode_id)
+        current_abs = ep_start + current_frame
         indices: list[int] = []
-        for i in range(self.K - 1, 0, -1):
-            hist_frame = current_frame - i * self.stride
-            abs_idx = ep_start + max(hist_frame, 0)
-            indices.append(abs_idx)
-        return indices
+        valid: list[bool] = []
+
+        if self.time_source == "timestamp":
+            current_ts = self._timestamp(current_abs)
+            for i in range(self.K - 1, 0, -1):
+                target_ts = current_ts - i * self.frame_stride_sec
+                abs_idx = self._nearest_index_at_or_before(ep_start, ep_end, current_abs, target_ts)
+                is_valid = abs_idx >= ep_start
+                indices.append(max(abs_idx, ep_start))
+                valid.append(is_valid)
+        else:
+            for i in range(self.K - 1, 0, -1):
+                rel_frame = current_frame - i * self.stride
+                is_valid = rel_frame >= 0
+                indices.append(ep_start + max(rel_frame, 0))
+                valid.append(is_valid)
+
+        return indices, np.asarray(valid, dtype=bool)
+
+    def _timestamp(self, abs_index: int) -> float:
+        """Timestamp (seconds) of an absolute dataset index, falling back to a uniform grid."""
+        ts = self._frame_field(abs_index, "timestamp")
+        if ts is None:
+            rel = abs_index - self._episode_start_for_abs(abs_index)
+            return float(rel) / self.fps
+        return float(ts)
+
+    def _nearest_index_at_or_before(
+        self, ep_start: int, ep_end: int, current_abs: int, target_ts: float
+    ) -> int:
+        """Largest in-episode absolute index whose timestamp is <= ``target_ts``.
+
+        Timestamps inside an episode are non-decreasing, so scanning backwards
+        from the current frame is correct.  The scan never leaves the episode,
+        so the worst case is bounded by the episode length.
+        """
+        candidate = min(current_abs, ep_end - 1)
+        for abs_idx in range(candidate, ep_start - 1, -1):
+            ts = self._timestamp(abs_idx)
+            if ts <= target_ts + 1e-6:
+                return abs_idx
+        return ep_start - 1
+
+    def _frame_field(self, abs_index: int, field: str):
+        """Read a metadata field for a single absolute index, or None if unavailable."""
+        if abs_index < 0:
+            return None
+        try:
+            sample = self._ds[abs_index]
+        except Exception:  # noqa: BLE001 - malformed/holes in the frame table
+            return None
+        if field not in sample:
+            return None
+        value = sample[field]
+        return value.item() if hasattr(value, "item") else value
+
+    def _episode_index(self):
+        """Return the LeRobot ``episode_data_index`` mapping, or None."""
+        ds = self._ds
+        inner = getattr(ds, "_dataset", ds)
+        return getattr(inner, "episode_data_index", None)
 
     def _episode_start(self, episode_id: int) -> int:
-        ds = self._ds
-        # LeRobot stores episode_data_index on the underlying dataset
-        inner = getattr(ds, "_dataset", ds)
-        if hasattr(inner, "episode_data_index"):
-            return int(inner.episode_data_index["from"][episode_id])
+        index = self._episode_index()
+        if index is not None:
+            return int(index["from"][episode_id])
         return 0
+
+    def _episode_end(self, episode_id: int) -> int:
+        """Exclusive end index of an episode.
+
+        Uses the ``to`` entry when present and otherwise derives the end from
+        the next episode's start (or the dataset length for the last episode).
+        """
+        index = self._episode_index()
+        if index is None:
+            return len(self._ds)
+        if "to" in index:
+            return int(index["to"][episode_id])
+        starts = np.asarray(index["from"])
+        if episode_id + 1 < len(starts):
+            return int(starts[episode_id + 1])
+        return len(self._ds)
+
+    def _episode_start_for_abs(self, abs_index: int) -> int:
+        """Episode start for an absolute dataset index (best effort)."""
+        index = self._episode_index()
+        if index is None:
+            return 0
+        starts = np.asarray(index["from"])
+        pos = int(np.searchsorted(starts, abs_index, side="right")) - 1
+        return int(starts[max(pos, 0)])
+
+    def _infer_fps(self) -> float:
+        """Infer the dataset frame rate from LeRobot metadata."""
+        for obj in (self._ds, getattr(self._ds, "_dataset", None), getattr(self._ds, "_ds", None)):
+            meta = getattr(obj, "meta", None)
+            if meta is not None and getattr(meta, "fps", None):
+                return float(meta.fps)
+            fps = getattr(obj, "fps", None)
+            if fps:
+                return float(fps)
+        logger.warning(
+            "Could not infer dataset fps from metadata; assuming 20.0. "
+            "Pass fps=... explicitly to MEMLeRobotDataset for exact behaviour."
+        )
+        return 20.0
+
+    def _discover_camera_keys(self) -> list[str]:
+        """Map dataset video features to the policy's short camera names.
+
+        LeRobot stores video features as ``observation.images.<name>`` while
+        the policy uses bare names (``base_0_rgb``). When discovery fails we
+        fall back to ``DEFAULT_CAMERA_KEYS`` so misconfiguration degrades to
+        "no history captured" rather than a crash.
+        """
+        meta = None
+        for obj in (self._ds, getattr(self._ds, "_dataset", None), getattr(self._ds, "_ds", None)):
+            meta = getattr(obj, "meta", None)
+            if meta is not None:
+                break
+        features = getattr(meta, "features", None) if meta is not None else None
+        if not features:
+            return list(self.DEFAULT_CAMERA_KEYS)
+
+        prefix = "observation.images."
+        keys = [
+            name[len(prefix):]
+            for name, spec in features.items()
+            if name.startswith(prefix) and (spec or {}).get("dtype") == "video"
+        ]
+        return keys or list(self.DEFAULT_CAMERA_KEYS)

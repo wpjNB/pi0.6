@@ -145,9 +145,11 @@ class Observation(Generic[ArrayT]):
                 data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
 
         # --- MEM optional fields ---
+        # Note: `to_dict` uses `dataclasses.asdict`, so optional MEM fields are always present
+        # as keys (with value None when unused). Check the value, not just key presence.
         image_history = None
         image_history_masks = None
-        if "image_history" in data:
+        if data.get("image_history") is not None:
             image_history = {}
             for key, frames in data["image_history"].items():
                 if frames.dtype == np.uint8:

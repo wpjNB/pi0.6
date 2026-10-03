@@ -243,10 +243,22 @@ class FakeDataConfig(DataConfigFactory):
         return DataConfig(repo_id=self.repo_id)
 
 
+def empty_group_factory(model_config: _model.BaseModelConfig) -> _transforms.Group:
+    """Default no-op data transform factory.
+
+    ``GroupFactory`` is a ``Protocol`` and therefore cannot be instantiated, so it cannot be
+    passed to ``dataclasses.field(default_factory=...)`` (which calls the factory with no
+    arguments when the field is omitted).
+    """
+    del model_config
+    return _transforms.Group()
+
+
 @dataclasses.dataclass(frozen=True)
 class SimpleDataConfig(DataConfigFactory):
-    # Factory for the data transforms.
-    data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=GroupFactory)
+    # Factory for the data transforms. Defaults to a no-op (empty transform group) so that
+    # configs may omit `data_transforms` (e.g. `pi05_recap`).
+    data_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=lambda: empty_group_factory)
     # Factory for the model transforms.
     model_transforms: tyro.conf.Suppress[GroupFactory] = dataclasses.field(default_factory=ModelTransformFactory)
 
